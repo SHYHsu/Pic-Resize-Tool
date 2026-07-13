@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; img-src 'self' blob: data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Batch Image Ratio Filter & Resizer</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: Canvas; color: CanvasText; }
+    main { max-width: 940px; margin: auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; } p { line-height: 1.5; }
+    section { margin-top: 24px; padding-top: 20px; border-top: 1px solid color-mix(in srgb, CanvasText 20%, transparent); }
+    .muted { color: GrayText; } .hidden { display: none; } .warning { color: #b42318; font-weight: 600; }
+    .choices { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
+    button, .file-label { font: inherit; padding: 9px 14px; border: 1px solid color-mix(in srgb, CanvasText 40%, transparent); background: Canvas; color: CanvasText; border-radius: 8px; cursor: pointer; }
+    button[aria-pressed="true"], button.primary { background: Highlight; border-color: Highlight; color: HighlightText; }
+    button:disabled { opacity: .45; cursor: not-allowed; } input[type=file] { display: none; }
+    #drop-zone { min-height: 140px; align-content: center; border: 2px dashed color-mix(in srgb, CanvasText 35%, transparent); border-radius: 10px; padding: 14px; }
+    #drop-zone.is-dragover { border-color: Highlight; background: color-mix(in srgb, Highlight 12%, transparent); }
+    #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; margin-top: 16px; }
+    figure { margin: 0; } img { width: 100%; height: 112px; object-fit: cover; border-radius: 7px; background: color-mix(in srgb, CanvasText 8%, transparent); }
+    figcaption { font-size: .85rem; overflow-wrap: anywhere; margin-top: 5px; } progress { width: min(520px, 100%); height: 18px; display: block; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Batch Image Ratio Filter & Resizer</h1>
+    <p class="muted">Add image files or a mixed-content folder. Every nested subfolder is scanned recursively; only PNG and JPG images are read, while video and text files are ignored.</p>
+    <p class="muted">Privacy: this standalone page works entirely in your browser. It makes no network requests. After processing starts the download, the selected files, previews, and in-memory processing data are cleared from the page.</p>
+    <section>
+      <strong>1. Add files or folders</strong>
+      <div id="drop-zone" class="choices">
+        <label class="file-label" for="files">Choose images</label>
+        <label class="file-label" for="folder">Choose a folder (including subfolders)</label>
+        <span class="muted">or drag files / folders here</span>
+        <input id="files" type="file" accept="image/png,image/jpeg,.png,.jpg,.jpeg" multiple>
+        <input id="folder" type="file" webkitdirectory multiple>
+      </div>
+      <p id="upload-summary" class="muted">No files selected.</p>
+    </section>
+    <section>
+      <strong>2. Filter by image orientation</strong>
+      <div class="choices">
+        <button type="button" data-ratio="square" aria-pressed="false">1:1</button>
+        <button type="button" data-ratio="horizontal" aria-pressed="false">Horizontal</button>
+        <button type="button" data-ratio="vertical" aria-pressed="false">Vertical</button>
+      </div>
+      <p id="summary" class="muted">Choose files and an orientation to begin.</p>
+      <p id="no-match" class="warning hidden" role="alert">No images match this selection.</p>
+      <div id="grid" aria-live="polite"></div>
+    </section>
+    <section id="size-section" class="hidden">
+      <strong>3. Choose output size</strong>
+      <div class="choices" id="size-controls"></div>
+    </section>
+    <section>
+      <button id="export" class="primary" type="button" disabled>4. Download processed folder (ZIP)</button>
+      <p id="export-message" class="muted"></p>
+      <progress id="progress" class="hidden" value="0" max="100">0%</progress>
+    </section>
+  </main>
+  <script>
+    const state = { files: [], selectedRatio: null, selectedSize: null };
+    const ratios = {
+      square: { label: '1:1', sizes: [[500, 500], [160, 160]] },
+      horizontal: { label: 'horizontal', sizes: [[1200, 627], [1920, 1080]] },
+      vertical: { label: 'vertical', sizes: [[1080, 1920]] }
+    };
+    const $ = id => document.getElementById(id);
+    const filesInput = $('files'), folderInput = $('folder'), dropZone = $('drop-zone');
+    const uploadSummary = $('upload-summary'), summary = $('summary'), grid = $('grid');
+    const sizeSection = $('size-section'), sizeControls = $('size-controls'), exportButton = $('export');
+    const noMatch = $('no-match'), progress = $('progress'), exportMessage = $('export-message');
+
+    filesInput.addEventListener('change', () => setFiles(filesInput.files));
+    folderInput.addEventListener('change', () => setFiles(folderInput.files));
+    ['dragenter', 'dragover'].forEach(name => document.addEventListener(name, event => { if (event.dataTransfer?.types.includes('Files')) event.preventDefault(); }));
+    document.addEventListener('drop', event => { if (event.dataTransfer?.types.includes('Files')) event.preventDefault(); });
+    ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, event => { event.preventDefault(); dropZone.classList.add('is-dragover'); }));
+    ['dragleave', 'drop'].forEach(name => dropZone.addEventListener(name, event => { event.preventDefault(); dropZone.classList.remove('is-dragover'); }));
+    dropZone.addEventListener('drop', async event => setFiles(await droppedFiles(event.dataTransfer)));
+    document.querySelectorAll('[data-ratio]').forEach(button => button.addEventListener('click', () => {
+      state.selectedRatio = button.dataset.ratio; state.selectedSize = null;
+      document.querySelectorAll('[data-ratio]').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
+      render();
+    }));
+
+    async function droppedFiles(dataTransfer) {
+      const entries = [...(dataTransfer.items || [])].map(item => item.webkitGetAsEntry && item.webkitGetAsEntry()).filter(Boolean);
+      if (!entries.length) return dataTransfer.files;
+      const files = [];
+      await Promise.all(entries.map(entry => walkEntry(entry, '', files)));
+      return files;
+    }
+    function walkEntry(entry, prefix, output) {
+      return new Promise(resolve => {
+        if (entry.isFile) entry.file(file => { Object.defineProperty(file, 'relativePath', { value: prefix + file.name }); output.push(file); resolve(); });
+        else if (entry.isDirectory) {
+          const reader = entry.createReader(), children = [];
+          const readAll = () => reader.readEntries(batch => { if (batch.length) { children.push(...batch); readAll(); } else Promise.all(children.map(child => walkEntry(child, prefix + entry.name + '/', output))).then(resolve); });
+          readAll();
+        } else resolve();
+      });
+    }
+    async function setFiles(fileList) {
+      const valid = [...fileList].filter(file => file.type === 'image/png' || file.type === 'image/jpeg' || /\.(png|jpe?g)$/i.test(file.name));
+      uploadSummary.textContent = `Reading ${valid.length} image file(s). Non-image files are ignored.`;
+      state.files.forEach(item => URL.revokeObjectURL(item.url));
+      state.files = (await Promise.all(valid.map(loadImage))).filter(Boolean);
+      uploadSummary.textContent = `${state.files.length} PNG/JPG image(s) loaded and ready for batch processing.`;
+      render();
+    }
+    function loadImage(file) {
+      return new Promise(resolve => {
+        const url = URL.createObjectURL(file), image = new Image();
+        image.onload = () => resolve({ file, image, url, width: image.naturalWidth, height: image.naturalHeight, path: file.relativePath || file.webkitRelativePath || file.name });
+        image.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+        image.src = url;
+      });
+    }
+    function matches(item) {
+      if (!item || !state.selectedRatio) return false;
+      if (state.selectedRatio === 'square') return Math.abs(item.width / item.height - 1) <= 0.015;
+      return state.selectedRatio === 'horizontal' ? item.width > item.height : item.height > item.width;
+    }
+    function selected() { return state.files.filter(matches); }
+    function render() {
+      const kept = selected(); grid.replaceChildren();
+      if (!state.selectedRatio) summary.textContent = state.files.length ? 'Choose the orientation to keep.' : 'Choose files and an orientation to begin.';
+      else summary.textContent = state.selectedRatio === 'square' ? `Usable 1:1 images (within 1.5% tolerance): ${kept.length} / ${state.files.length}.` : `Usable ${ratios[state.selectedRatio].label} images: ${kept.length} / ${state.files.length}.`;
+      noMatch.classList.toggle('hidden', !(state.selectedRatio && state.files.length && kept.length === 0));
+      kept.slice(0, 100).forEach(item => {
+        const figure = document.createElement('figure'), image = document.createElement('img'), caption = document.createElement('figcaption');
+        image.src = item.url; image.alt = item.file.name; caption.textContent = `${item.path} - ${item.width} x ${item.height}`;
+        figure.append(image, caption); grid.append(figure);
+      });
+      if (kept.length > 100) { const note = document.createElement('p'); note.className = 'muted'; note.textContent = `Only the first 100 images are previewed. All ${kept.length} matching images will be processed.`; grid.append(note); }
+      sizeControls.replaceChildren(); sizeSection.classList.toggle('hidden', !state.selectedRatio);
+      if (state.selectedRatio) ratios[state.selectedRatio].sizes.forEach(([width, height]) => {
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = `${width} x ${height}`; button.disabled = !kept.length;
+        button.setAttribute('aria-pressed', String(state.selectedSize?.[0] === width && state.selectedSize?.[1] === height));
+        button.addEventListener('click', () => { state.selectedSize = [width, height]; progress.value = 0; progress.classList.remove('hidden'); exportMessage.textContent = `${kept.length} image(s) are ready to process.`; render(); });
+        sizeControls.append(button);
+      });
+      exportButton.disabled = !(kept.length && state.selectedSize);
+    }
+    exportButton.addEventListener('click', async () => {
+      const items = selected(), [width, height] = state.selectedSize, entries = [{ name: 'processed_images/', data: new Uint8Array(), directory: true }], directories = new Set(['processed_images/']);
+      exportButton.disabled = true; progress.classList.remove('hidden'); progress.value = 0;
+      try {
+        for (let index = 0; index < items.length; index++) {
+          const item = items[index]; progress.value = Math.round(index / items.length * 100); exportMessage.textContent = `Processing ${index + 1} of ${items.length} images.`;
+          const relativePath = item.path.replace(/\\/g, '/').replace(/^\/+/, '');
+          const filePath = `processed_images/${relativePath}`;
+          const folders = filePath.split('/').slice(0, -1);
+          for (let depth = 1; depth <= folders.length; depth++) directories.add(`${folders.slice(0, depth).join('/')}/`);
+          const blob = await resize(item.image, width, height, item.file.type);
+          if (!blob) throw new Error(`Could not encode ${item.file.name}.`);
+          entries.push({ name: filePath, data: new Uint8Array(await blob.arrayBuffer()), directory: false });
+        }
+        [...directories].sort().forEach(name => { if (name !== 'processed_images/') entries.unshift({ name, data: new Uint8Array(), directory: true }); });
+        const archive = zipStore(entries), link = document.createElement('a'); link.href = URL.createObjectURL(archive); link.download = 'processed_images.zip'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+        clearSession(); progress.value = 100; exportMessage.textContent = `${items.length} image(s) were written to processed_images.zip. Open processed_images and its subfolders after extracting.`;
+      } catch (error) {
+        exportMessage.textContent = `Processing failed: ${error.message}`;
+        exportButton.disabled = false;
+      }
+    });
+    function clearSession() {
+      state.files.forEach(item => URL.revokeObjectURL(item.url));
+      state.files = []; state.selectedRatio = null; state.selectedSize = null;
+      filesInput.value = ''; folderInput.value = '';
+      document.querySelectorAll('[data-ratio]').forEach(button => button.setAttribute('aria-pressed', 'false'));
+      uploadSummary.textContent = 'No files selected.';
+      render();
+    }
+    function resize(image, targetW, targetH, type) {
+      const scale = Math.max(targetW / image.naturalWidth, targetH / image.naturalHeight), drawW = image.naturalWidth * scale, drawH = image.naturalHeight * scale;
+      const canvas = document.createElement('canvas'); canvas.width = targetW; canvas.height = targetH;
+      canvas.getContext('2d').drawImage(image, (targetW - drawW) / 2, (targetH - drawH) / 2, drawW, drawH);
+      return new Promise(resolve => canvas.toBlob(resolve, type, type === 'image/jpeg' ? 0.92 : undefined));
+    }
+    function zipStore(entries) {
+      const encoder = new TextEncoder(), parts = [], directory = []; let offset = 0;
+      for (const entry of entries) {
+        const name = encoder.encode(entry.name), crc = crc32(entry.data), header = new Uint8Array(30 + name.length), view = new DataView(header.buffer);
+        view.setUint32(0, 0x04034b50, true); view.setUint16(4, 20, true); view.setUint16(6, 0x0800, true); view.setUint32(14, crc, true); view.setUint32(18, entry.data.length, true); view.setUint32(22, entry.data.length, true); view.setUint16(26, name.length, true); header.set(name, 30);
+        parts.push(header, entry.data); directory.push({ name, crc, size: entry.data.length, offset, isDirectory: Boolean(entry.directory) }); offset += header.length + entry.data.length;
+      }
+      const start = offset;
+      for (const entry of directory) {
+        const record = new Uint8Array(46 + entry.name.length), view = new DataView(record.buffer);
+        view.setUint32(0, 0x02014b50, true); view.setUint16(4, 20, true); view.setUint16(6, 20, true); view.setUint16(8, 0x0800, true); view.setUint32(16, entry.crc, true); view.setUint32(20, entry.size, true); view.setUint32(24, entry.size, true); view.setUint16(28, entry.name.length, true); view.setUint32(38, entry.isDirectory ? 0x10 : 0, true); view.setUint32(42, entry.offset, true); record.set(entry.name, 46); parts.push(record); offset += record.length;
+      }
+      const end = new Uint8Array(22), endView = new DataView(end.buffer); endView.setUint32(0, 0x06054b50, true); endView.setUint16(8, directory.length, true); endView.setUint16(10, directory.length, true); endView.setUint32(12, offset - start, true); endView.setUint32(16, start, true); parts.push(end);
+      return new Blob(parts, { type: 'application/zip' });
+    }
+    function crc32(data) { let crc = -1; for (const byte of data) { crc ^= byte; for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1)); } return (crc ^ -1) >>> 0; }
+  </script>
+</body>
+</html>
